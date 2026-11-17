@@ -152,6 +152,10 @@ class VideoSelector(BaseTool):
                 "type": "string",
                 "description": "Text describing what to avoid.",
             },
+            "audio_path": {
+                "type": "string",
+                "description": "Local audio file for audio-conditioned video.",
+            },
             "seed": {"type": ["integer", "null"]},
             "duration_seconds": {"type": "number"},
             "fps": {"type": "number"},
@@ -690,9 +694,12 @@ class VideoSelector(BaseTool):
 
         filtered: list[BaseTool] = []
         matched_operation = False
+        requires_audio = bool(inputs.get("audio_path") or inputs.get("audio_url"))
         for tool in candidates:
             supports = getattr(tool, "supports", {})
             props = getattr(tool, "input_schema", {}).get("properties", {})
+            if requires_audio and not supports.get("audio_conditioning"):
+                continue
 
             if operation == "image_to_video":
                 if (
