@@ -38,8 +38,8 @@ class VideoSelector(BaseTool):
     # Operations that REQUIRE motion: an image-only tool (image_selector) is not
     # an acceptable last-resort fallback for these, so fallback_tools_for() drops it.
     MOTION_REQUIRED_OPERATIONS = frozenset(
-        {"image_to_video", "reference_to_video", "video_edit",
-         "video_to_video_edit", "video_to_video_reference"}
+        {"image_to_video", "first_last_frame_to_video", "reference_to_video",
+         "video_edit", "video_to_video_edit", "video_to_video_reference"}
     )
     # Default score gap for the preferred_provider override (see input_schema).
     PREFERRED_PROVIDER_GAP = 0.15
@@ -47,6 +47,7 @@ class VideoSelector(BaseTool):
     capabilities = [
         "text_to_video",
         "image_to_video",
+        "first_last_frame_to_video",
         "reference_to_video",
         "video_edit",
         "video_to_video_edit",
@@ -60,6 +61,7 @@ class VideoSelector(BaseTool):
         "user_preference_routing": True,
         "offline_fallback": True,
         "reference_image": True,
+        "first_last_frame_to_video": True,
         "stock_fallback": True,
     }
     best_for = [
@@ -105,6 +107,7 @@ class VideoSelector(BaseTool):
                 "enum": [
                     "text_to_video",
                     "image_to_video",
+                    "first_last_frame_to_video",
                     "reference_to_video",
                     "video_edit",
                     "video_to_video_edit",
@@ -118,6 +121,7 @@ class VideoSelector(BaseTool):
                 "enum": [
                     "text_to_video",
                     "image_to_video",
+                    "first_last_frame_to_video",
                     "reference_to_video",
                     "video_edit",
                     "video_to_video_edit",
@@ -136,6 +140,21 @@ class VideoSelector(BaseTool):
                 "type": "string",
                 "description": "Duration hint (e.g., '5', '10'). Passed through to the selected provider.",
             },
+            "first_frame_path": {
+                "type": "string",
+                "description": "Starting image for image_to_video or first_last_frame_to_video.",
+            },
+            "last_frame_path": {
+                "type": "string",
+                "description": "Ending image for first_last_frame_to_video.",
+            },
+            "negative_prompt": {
+                "type": "string",
+                "description": "Text describing what to avoid.",
+            },
+            "seed": {"type": ["integer", "null"]},
+            "duration_seconds": {"type": "number"},
+            "fps": {"type": "number"},
             "reference_image_path": {
                 "type": "string",
                 "description": "Local path to a reference image for image_to_video. Auto-uploaded if the provider requires a URL.",
@@ -326,11 +345,20 @@ class VideoSelector(BaseTool):
 
     #: one first-frame image and no operation means image_to_video; without this the
     #: call scored as text_to_video and an image-only provider was filtered out
-    _FIRST_FRAME_KEYS = ("reference_image_path", "reference_image_url", "image_url")
+    _FIRST_FRAME_KEYS = (
+        "first_frame_path", "reference_image_path", "reference_image_url", "image_url"
+    )
+    _LAST_FRAME_KEYS = (
+        "last_frame_path", "last_frame_image", "last_image_path", "last_image_url"
+    )
 
     @classmethod
     def _with_operation(cls, inputs: dict[str, object]) -> dict[str, object]:
-        if inputs.get("operation") or not any(inputs.get(k) for k in cls._FIRST_FRAME_KEYS):
+        if inputs.get("operation"):
+            return inputs
+        if any(inputs.get(k) for k in cls._LAST_FRAME_KEYS):
+            return {**inputs, "operation": "first_last_frame_to_video"}
+        if not any(inputs.get(k) for k in cls._FIRST_FRAME_KEYS):
             return inputs
         return {**inputs, "operation": "image_to_video"}
 
@@ -363,6 +391,16 @@ class VideoSelector(BaseTool):
         if any(tool.get_status() == ToolStatus.AVAILABLE for tool in self._providers()):
             return ToolStatus.AVAILABLE
         return ToolStatus.UNAVAILABLE
+
+    def is_operation_available(self, operation: str) -> bool:
+        """Whether any registered provider can serve *operation*."""
+        if operation == "first_last_frame_to_video":
+            return any(
+                getattr(tool, "supports", {}).get("first_last_frame_to_video")
+                and tool.get_status() == ToolStatus.AVAILABLE
+                for tool in self._providers()
+            )
+        return self.get_status() == ToolStatus.AVAILABLE
 
     def estimate_cost(self, inputs: dict[str, object]) -> float:
         inputs = self._with_operation(inputs)
@@ -404,6 +442,32 @@ class VideoSelector(BaseTool):
                     "normalized_task_context": task_context,
                 },
             )
+
+        # An explicit preferred_tool is a hard route, never a fallback.
+        preferred_tool = inputs.get("preferred_tool")
+        if preferred_tool:
+            from tools.tool_registry import registry
+
+            tool = registry.get(str(preferred_tool))
+            if tool is None:
+                return ToolResult(
+                    success=False,
+                    error=f"preferred_tool {preferred_tool!r} is not registered.",
+                )
+            adapted = dict(inputs)
+            if hasattr(tool, "input_schema"):
+                required = tool.input_schema.get("properties", {})
+                if "query" in required and "query" not in adapted:
+                    adapted["query"] = adapted.get("prompt", "")
+            result = tool.execute(adapted)
+            if result.success:
+                result.data.setdefault("selected_tool", tool.name)
+                result.data["selected_provider"] = tool.provider
+                result.data["selection_reason"] = f"preferred_tool {tool.name}"
+                result.data["alternatives_considered"] = [
+                    item.name for item in candidates if item.name != tool.name
+                ]
+            return result
 
         # Normal generation — use scored selection
         task_context = self._prepare_task_context(inputs)
@@ -648,6 +712,17 @@ class VideoSelector(BaseTool):
                 ):
                     matched_operation = True
                     filtered.append(tool)
+                continue
+
+            if operation == "first_last_frame_to_video":
+                if (
+                    supports.get("first_last_frame_to_video")
+                    and "first_frame_path" in props
+                    and "last_frame_path" in props
+                ):
+                    matched_operation = True
+                    if self._operation_ready(tool, "first_last_frame_to_video"):
+                        filtered.append(tool)
                 continue
 
             matched_operation = True
